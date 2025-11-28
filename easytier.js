@@ -1,203 +1,189 @@
 (function(){
 'use strict';
 
-// ===================== 纯粹配置 =====================
-const MASTER_ID = 'p1-master-node-v8'; // 固定主节点 ID
+// ===================== 无主 Mesh 配置 =====================
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
   debug: 0
 };
 
-// ===================== 核心状态 =====================
+// 每个人最多维持 8 个直连，多了拒绝，少了去补
+const MAX_NEIGHBORS = 8; 
+// 引导节点池（种子）：仅用于初次进入网络，连上后就不再依赖它们
+const SEEDS = ['p1-s1', 'p1-s2', 'p1-s3']; 
+
+// ===================== 核心逻辑 =====================
 const app = {
   myId: '',
-  myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*1000),
+  myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*10000),
   peer: null,
-  conns: {}, // 活跃连接池: id -> conn
-  msgs: [],  // 消息历史
-  seen: new Set(), // 去重指纹
-  isMaster: false,
+  conns: {}, // 活跃连接: pid -> conn
+  knownPeers: new Set(), // 知道但不一定连着的节点池
+  seenMsgs: new Set(), // 消息去重指纹
   
-  // 启动入口
-  init() {
-    this.log('正在初始化网络...');
-    // 1. 尝试篡位：直接申请当主节点
-    this.tryBecomeMaster();
-    
-    // 2. 守护进程：每3秒清理死链，每分钟清理指纹
-    setInterval(() => this.cleanup(), 3000);
-    setInterval(() => this.seen.clear(), 60000);
-    
-    // 3. 页面唤醒重连
-    document.addEventListener('visibilitychange', () => {
-      if(document.visibilityState === 'visible' && (!this.peer || this.peer.disconnected)) {
-        this.log('唤醒重连...');
-        this.tryBecomeMaster();
-      }
-    });
-  },
-
+  // 日志
   log(s) {
-    // 限制日志长度，防止 UI 卡死
     const el = document.getElementById('miniLog');
-    if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 500);
+    if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 300);
   },
 
-  // ====== 连接流程 ======
-  
-  tryBecomeMaster() {
-    if(this.peer) this.peer.destroy();
+  init() {
+    this.start();
     
-    // 尝试以 MASTER_ID 启动
-    const p = new Peer(MASTER_ID, CONFIG);
+    // 🕸️ 网络维护进程
+    setInterval(() => {
+      this.cleanup();        // 清理死链
+      this.fillSlots();      // 缺人补人
+      this.exchangePeers();  // 交换通讯录
+    }, 5000);
     
-    p.on('open', id => {
-      this.onReady(p, id, true);
+    // 指纹清理
+    setInterval(() => this.seenMsgs.clear(), 60000);
+  },
+
+  start() {
+    if(this.peer) return;
+    
+    // 随机尝试抢占一个种子位，抢不到就做普通节点
+    // 这样保证网络里总有几个固定的入口 ID 存在
+    const seedIndex = Math.floor(Math.random() * SEEDS.length);
+    const tryId = (Math.random() > 0.5) ? SEEDS[seedIndex] : undefined; // 50%概率尝试当种子
+
+    this.initPeer(tryId);
+  },
+
+  initPeer(id) {
+    const p = new Peer(id, CONFIG);
+    
+    p.on('open', myId => {
+      this.myId = myId;
+      this.peer = p;
+      this.log(`✅ 上线: ${myId.slice(0,6)}`);
+      ui.updateSelf();
+      
+      // 刚上线，先连种子节点混个脸熟
+      SEEDS.forEach(s => { if(s !== myId) this.connectTo(s); });
     });
-    
+
     p.on('error', err => {
-      if (err.type === 'unavailable-id') {
-        // 失败：说明主节点活着，那我做普通节点
-        this.startAsNormal();
-      } else {
-        this.log('网络错误: ' + err.type);
-        setTimeout(() => this.tryBecomeMaster(), 2000);
+      // 如果种子 ID 被占，说明种子在线，那我做普通人
+      if(err.type === 'unavailable-id') {
+        this.initPeer(undefined); // 重新以随机 ID 启动
       }
     });
+
+    p.on('connection', conn => this.handleConn(conn, true));
   },
 
-  startAsNormal() {
-    const p = new Peer(CONFIG); // 随机 ID
-    p.on('open', id => {
-      this.onReady(p, id, false);
-      // 连接主节点
-      this.connectTo(MASTER_ID);
-    });
-    p.on('error', e => this.log('普通节点错误: ' + e.type));
-  },
-
-  onReady(p, id, isMaster) {
-    this.peer = p;
-    this.myId = id;
-    this.isMaster = isMaster;
-    this.conns = {}; // 重置连接池
-    this.log(`✅ 上线成功: ${isMaster ? '我是主机' : '普通成员'}`);
-    ui.updateSelf();
-    
-    // 监听入站
-    p.on('connection', conn => this.setupConn(conn));
-  },
-
+  // 建立连接
   connectTo(targetId) {
-    if(!this.peer || this.conns[targetId] || targetId === this.myId) return;
+    if(targetId === this.myId || this.conns[targetId]) return;
+    // 超过连接上限，不再主动出击（除非是种子）
+    if(Object.keys(this.conns).length >= MAX_NEIGHBORS) return;
+    
     const conn = this.peer.connect(targetId, {reliable: true});
-    this.setupConn(conn);
+    this.handleConn(conn, false);
   },
 
-  setupConn(conn) {
+  handleConn(conn, isIncoming) {
     const pid = conn.peer;
     
     conn.on('open', () => {
+      // 连接成功
       this.conns[pid] = conn;
-      this.log(`🔗 连接: ${pid.slice(0,6)}`);
-      ui.renderList(); // 刷新列表
+      this.knownPeers.add(pid); // 记入小本本
+      ui.renderList();
       
       // 握手
-      conn.send({t: 'HELLO', name: this.myName});
+      conn.send({t: 'HELLO', n: this.myName});
+    });
+
+    conn.on('data', d => {
+      // 1. 基础信息交换
+      if(d.t === 'HELLO') {
+        conn.label = d.n;
+        this.log(`🔗 连上: ${d.n}`);
+        ui.renderList();
+      }
       
-      // 如果我是主机，把别人介绍给他 (简单的路由发现)
-      if(this.isMaster) {
-        const others = Object.keys(this.conns).filter(id => id !== pid);
-        if(others.length) conn.send({t: 'PEERS', list: others});
+      // 2. 通讯录交换 (Gossip)
+      if(d.t === 'PEER_EX' && Array.isArray(d.list)) {
+        d.list.forEach(id => this.knownPeers.add(id));
+        // 如果我很缺连接，就从这里面挑人连
+        this.fillSlots();
+      }
+      
+      // 3. 消息处理 (Flood)
+      if(d.t === 'MSG') {
+        if(this.seenMsgs.has(d.id)) return; // 已阅，丢弃
+        this.seenMsgs.add(d.id);
+        
+        ui.appendMsg(d.sender, d.txt, false);
+        this.flood(d, pid); // 传给除了来源外的其他人
       }
     });
 
-    conn.on('data', d => this.handleData(pid, d));
-    
-    conn.on('close', () => {
-      delete this.conns[pid];
-      ui.renderList();
-    });
-    
-    conn.on('error', () => {
-      delete this.conns[pid];
-      ui.renderList();
-    });
+    conn.on('close', () => this.dropPeer(pid));
+    conn.on('error', () => this.dropPeer(pid));
   },
 
-  // ====== 消息处理核心 (修复刷屏的关键) ======
-  handleData(fromId, d) {
-    // 1. 基础握手
-    if(d.t === 'HELLO') {
-      if(this.conns[fromId]) this.conns[fromId].label = d.name;
-      ui.renderList();
-      return;
-    }
-    
-    // 2. 节点发现
-    if(d.t === 'PEERS' && Array.isArray(d.list)) {
-      d.list.forEach(id => this.connectTo(id));
-      return;
-    }
-
-    // 3. 聊天消息 (重点修复)
-    if(d.t === 'MSG') {
-      // ⚡️ 关键：去重检查 ⚡️
-      if(this.seen.has(d.id)) return; // 见过？丢弃！
-      this.seen.add(d.id);            // 没见过？记录！
-      
-      // UI 显示
-      ui.appendMsg(d.sender, d.txt, false);
-      
-      // ⚡️ 关键：转发 (Flood) ⚡️
-      // 规则：转发给所有连接，但【排除】发送给我的那个人
-      this.broadcast(d, fromId);
-    }
-  },
-
-  // 发送/转发函数
-  broadcast(packet, excludeId = null) {
-    Object.keys(this.conns).forEach(pid => {
-      if (pid === excludeId) return; // 绝不发回来源
-      const conn = this.conns[pid];
-      if (conn && conn.open) {
-        try { conn.send(packet); } catch(e){}
-      }
-    });
-  },
-
-  sendText(txt) {
-    if(!txt) return;
-    const id = Date.now() + '-' + Math.random().toString(36).substr(2,5);
-    const packet = { t: 'MSG', id: id, txt: txt, sender: this.myName };
-    
-    // 自己也要记录指纹，防止回路回来
-    this.seen.add(id);
-    
-    // UI 显示
-    ui.appendMsg('我', txt, true);
-    
-    // 发送给所有人
-    this.broadcast(packet, null);
-  },
-
-  cleanup() {
-    // 移除已断开的连接对象
-    Object.keys(this.conns).forEach(pid => {
-      if(!this.conns[pid].open) delete this.conns[pid];
-    });
-    // 没连上主节点？重试
-    if(!this.isMaster && !this.conns[MASTER_ID]) {
-      this.connectTo(MASTER_ID);
-    }
+  dropPeer(pid) {
+    delete this.conns[pid];
     ui.renderList();
   },
+
+  // 广播 (Flood)
+  flood(packet, excludeId) {
+    Object.keys(this.conns).forEach(pid => {
+      if(pid !== excludeId) {
+        try { this.conns[pid].send(packet); } catch(e){}
+      }
+    });
+  },
+
+  // 发送入口
+  sendText(txt) {
+    const id = Date.now() + Math.random().toString(36);
+    const packet = {t: 'MSG', id, txt, sender: this.myName};
+    this.seenMsgs.add(id);
+    
+    ui.appendMsg('我', txt, true);
+    this.flood(packet, null); // 发给所有人
+  },
+
+  // === 🕸️ 自愈逻辑 ===
   
-  // 简易文件发送 (直连)
-  sendFile(file, targetId) {
-    // 暂略，确保聊天先通
-    alert('当前版本优先保证聊天稳定，请先测试文字');
+  // 1. 清理无效连接
+  cleanup() {
+    Object.keys(this.conns).forEach(pid => {
+      if(!this.conns[pid].open) this.dropPeer(pid);
+    });
+  },
+
+  // 2. 缺人补人
+  fillSlots() {
+    const current = Object.keys(this.conns).length;
+    if (current < 3) { // 最少保持 3 个连接
+      // 从小本本里随机挑人连
+      const candidates = [...this.knownPeers].filter(p => !this.conns[p] && p !== this.myId);
+      if(candidates.length > 0) {
+        // 随机连一个，避免所有人都连同一个
+        const luckyOne = candidates[Math.floor(Math.random() * candidates.length)];
+        this.connectTo(luckyOne);
+      }
+    }
+  },
+
+  // 3. 交换通讯录 (Gossip)
+  exchangePeers() {
+    // 随机把我知道的节点告诉我的邻居
+    const myKnowledge = [...this.knownPeers, this.myId].slice(0, 20); // 最多带20个，省流量
+    const packet = {t: 'PEER_EX', list: myKnowledge};
+    
+    Object.values(this.conns).forEach(c => {
+      if(c.open) c.send(packet);
+    });
   }
 };
 
@@ -206,50 +192,45 @@ const ui = {
   init() {
     document.getElementById('btnSend').onclick = () => {
       const el = document.getElementById('editor');
-      app.sendText(el.innerText);
-      el.innerText = '';
+      if(el.innerText.trim()) {
+        app.sendText(el.innerText.trim());
+        el.innerText = '';
+      }
     };
-    
-    // 侧边栏
     document.getElementById('btnBack').onclick = () => {
       document.getElementById('sidebar').classList.remove('hidden');
     };
     
-    // 初始状态
     this.updateSelf();
     this.renderList();
   },
 
   updateSelf() {
     document.getElementById('myId').innerText = app.myId ? app.myId.slice(0,6) : '...';
-    document.getElementById('statusText').innerText = app.isMaster ? '👑 主机' : '在线';
+    document.getElementById('statusText').innerText = '无主网状网络';
     document.getElementById('statusDot').className = 'dot ' + (app.myId ? 'online':'');
   },
 
-  // 实时重新渲染列表 (修复虚节点)
   renderList() {
     const list = document.getElementById('contactList');
     list.innerHTML = `
       <div class="contact-item active" onclick="ui.toggleSidebar()">
         <div class="avatar" style="background:#2a7cff">全</div>
-        <div class="c-info"><div class="c-name">公共频道</div><div class="c-msg">全员广播</div></div>
+        <div class="c-info"><div class="c-name">公共频道</div><div class="c-msg">Mesh 广播</div></div>
       </div>
     `;
     
     const count = Object.keys(app.conns).length;
-    document.getElementById('onlineCount').innerText = count + ' 连接';
+    document.getElementById('onlineCount').innerText = count + ' 邻居';
 
     Object.keys(app.conns).forEach(pid => {
       const c = app.conns[pid];
-      const name = c.label || pid.slice(0,6);
-      const isMaster = (pid === MASTER_ID);
-      
       list.innerHTML += `
         <div class="contact-item">
-          <div class="avatar" style="background:${isMaster?'#ff9f00':'#333'}">${name[0]}</div>
+          <div class="avatar" style="background:#333">${(c.label||pid)[0]}</div>
           <div class="c-info">
-            <div class="c-name">${name} ${isMaster?'(主机)':''}</div>
-            <div class="c-msg">ID: ${pid.slice(0,6)}</div>
+            <div class="c-name">${c.label || pid.slice(0,6)}</div>
+            <div class="c-msg">直连节点</div>
           </div>
         </div>
       `;

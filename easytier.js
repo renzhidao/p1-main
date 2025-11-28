@@ -1,230 +1,203 @@
 (function(){
 'use strict';
 
-// ===================== 大规模 Mesh 配置 =====================
-// 定义 10 个平行宇宙（Shard），用户随机落入其中一个
-// 想要扩容？增加 SHARD_COUNT 即可
-const SHARD_COUNT = 10; 
-const SEED_PREFIX = 'p1-seed-';
-
+// ===================== 纯粹配置 =====================
+const MASTER_ID = 'p1-master-node-v8'; // 固定主节点 ID
 const CONFIG = {
   host: 'peerjs.92k.de', port: 443, secure: true, path: '/',
   config: { iceServers: [{urls:'stun:stun.l.google.com:19302'}] },
   debug: 0
 };
 
-// ===================== 核心逻辑 =====================
+// ===================== 核心状态 =====================
 const app = {
   myId: '',
-  myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*100000),
-  myShard: 0, // 我所在的宇宙编号
-  
+  myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*1000),
   peer: null,
-  conns: {}, // pid -> conn
-  isSeed: false,
+  conns: {}, // 活跃连接池: id -> conn
+  msgs: [],  // 消息历史
+  seen: new Set(), // 去重指纹
+  isMaster: false,
   
-  // 状态统计
-  shardStats: {}, // 记录其他宇宙的人数估算
-  
-  log(s) {
-    const el = document.getElementById('miniLog');
-    if(el) el.innerText = s + '\n' + el.innerText.slice(0,300);
-  },
-
+  // 启动入口
   init() {
-    // 1. 确定我的宇宙
-    // 如果是老用户，保持在原来的宇宙；新用户随机分配
-    let savedShard = localStorage.getItem('p1_shard');
-    if (savedShard === null) {
-      savedShard = Math.floor(Math.random() * SHARD_COUNT);
-      localStorage.setItem('p1_shard', savedShard);
-    }
-    this.myShard = parseInt(savedShard);
+    this.log('正在初始化网络...');
+    // 1. 尝试篡位：直接申请当主节点
+    this.tryBecomeMaster();
     
-    // 2. 启动连接
-    // 优先尝试成为本宇宙的种子节点
-    const delay = Math.floor(Math.random() * 2000);
-    setTimeout(() => this.tryBecomeSeed(0), delay);
+    // 2. 守护进程：每3秒清理死链，每分钟清理指纹
+    setInterval(() => this.cleanup(), 3000);
+    setInterval(() => this.seen.clear(), 60000);
     
-    // 3. 守护进程
-    setInterval(() => this.maintainNetwork(), 5000);
-    setInterval(() => this.broadcastStats(), 10000); // 每10秒汇报存活
-  },
-
-  // 尝试成为本宇宙的种子
-  tryBecomeSeed(index) {
-    // 每个宇宙有 3 个种子位：p1-seed-5-alpha, p1-seed-5-beta...
-    const seeds = ['alpha', 'beta', 'gamma'];
-    if (index >= seeds.length) {
-      this.startNormal();
-      return;
-    }
-
-    const seedId = `${SEED_PREFIX}${this.myShard}-${seeds[index]}`;
-    this.log(`尝试成为宇宙 ${this.myShard} 的守护者 (${seeds[index]})...`);
-
-    const p = new Peer(seedId, CONFIG);
-
-    p.on('open', (id) => {
-      this.myId = id;
-      this.isSeed = true;
-      this.peer = p;
-      this.bindEvents(p);
-      this.log(`👑 我是宇宙 ${this.myShard} 的守护者`);
-      ui.render();
-      
-      // 种子互联：连接本宇宙其他种子
-      seeds.forEach(suffix => {
-        const other = `${SEED_PREFIX}${this.myShard}-${suffix}`;
-        if(other !== id) this.connectTo(other);
-      });
-      
-      // 跨宇宙桥接：尝试连接下一个宇宙的 alpha 种子，形成环状骨干网
-      const nextShard = (this.myShard + 1) % SHARD_COUNT;
-      this.connectTo(`${SEED_PREFIX}${nextShard}-alpha`);
-    });
-
-    p.on('error', (err) => {
-      if (err.type === 'unavailable-id') {
-        this.tryBecomeSeed(index + 1);
-      } else {
-        this.tryBecomeSeed(index + 1); // 其他错误也跳过
+    // 3. 页面唤醒重连
+    document.addEventListener('visibilitychange', () => {
+      if(document.visibilityState === 'visible' && (!this.peer || this.peer.disconnected)) {
+        this.log('唤醒重连...');
+        this.tryBecomeMaster();
       }
     });
   },
 
-  startNormal() {
-    this.isSeed = false;
-    const p = new Peer(CONFIG);
+  log(s) {
+    // 限制日志长度，防止 UI 卡死
+    const el = document.getElementById('miniLog');
+    if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 500);
+  },
+
+  // ====== 连接流程 ======
+  
+  tryBecomeMaster() {
+    if(this.peer) this.peer.destroy();
     
-    p.on('open', (id) => {
-      this.myId = id;
-      this.peer = p;
-      this.bindEvents(p);
-      this.log(`👤 居民 (宇宙 ${this.myShard})`);
-      ui.render();
-      
-      // 连接本宇宙的种子
-      ['alpha', 'beta', 'gamma'].forEach(suffix => {
-        this.connectTo(`${SEED_PREFIX}${this.myShard}-${suffix}`);
-      });
+    // 尝试以 MASTER_ID 启动
+    const p = new Peer(MASTER_ID, CONFIG);
+    
+    p.on('open', id => {
+      this.onReady(p, id, true);
     });
     
-    p.on('error', e => {});
+    p.on('error', err => {
+      if (err.type === 'unavailable-id') {
+        // 失败：说明主节点活着，那我做普通节点
+        this.startAsNormal();
+      } else {
+        this.log('网络错误: ' + err.type);
+        setTimeout(() => this.tryBecomeMaster(), 2000);
+      }
+    });
   },
 
-  bindEvents(p) {
-    p.on('connection', conn => this.setupConn(conn));
-    p.on('disconnected', () => p.reconnect());
+  startAsNormal() {
+    const p = new Peer(CONFIG); // 随机 ID
+    p.on('open', id => {
+      this.onReady(p, id, false);
+      // 连接主节点
+      this.connectTo(MASTER_ID);
+    });
+    p.on('error', e => this.log('普通节点错误: ' + e.type));
   },
 
-  connectTo(pid) {
-    if(pid === this.myId || this.conns[pid]) return;
-    // 普通人只连 5 个，种子连 20 个
-    const limit = this.isSeed ? 20 : 5;
-    if(Object.keys(this.conns).length >= limit) return;
+  onReady(p, id, isMaster) {
+    this.peer = p;
+    this.myId = id;
+    this.isMaster = isMaster;
+    this.conns = {}; // 重置连接池
+    this.log(`✅ 上线成功: ${isMaster ? '我是主机' : '普通成员'}`);
+    ui.updateSelf();
     
-    const conn = this.peer.connect(pid, {reliable:true});
+    // 监听入站
+    p.on('connection', conn => this.setupConn(conn));
+  },
+
+  connectTo(targetId) {
+    if(!this.peer || this.conns[targetId] || targetId === this.myId) return;
+    const conn = this.peer.connect(targetId, {reliable: true});
     this.setupConn(conn);
   },
 
   setupConn(conn) {
     const pid = conn.peer;
-    conn.on('open', () => {
-      this.conns[pid] = { conn, open: true, shard: -1 }; // 暂不知道对方宇宙
-      // 握手：报上名号和宇宙ID
-      conn.send({t:'HELLO', n: this.myName, s: this.myShard});
-    });
-
-    conn.on('data', (d) => {
-      if(d.t === 'HELLO') {
-        if(this.conns[pid]) {
-          this.conns[pid].label = d.n;
-          this.conns[pid].shard = d.s;
-        }
-        // 如果对方是其他宇宙的，标记为“星际通道”
-        if(d.s !== this.myShard) this.log(`🌌 建立星际通道: 宇宙 ${d.s}`);
-      }
-      
-      // 消息转发逻辑 (Gossip)
-      if(d.t === 'MSG') {
-        // 如果是本宇宙消息，或者是全宇宙广播
-        if(d.shard === this.myShard || d.target === 'global') {
-          ui.addMsg(d.n, d.txt, false, d.shard);
-        }
-        
-        // 转发规则：
-        // 1. 如果 target='global'，发给所有人（TTL控制）
-        // 2. 如果是本宇宙消息，只发给本宇宙连接
-        this.flood(d, pid);
-      }
-      
-      // 状态统计
-      if(d.t === 'STATS') {
-        // 更新全网人数估算
-        this.shardStats[d.fromShard] = d.count;
-        ui.updateGlobalCount();
-      }
-    });
-
-    conn.on('close', () => { delete this.conns[pid]; });
-    conn.on('error', () => { delete this.conns[pid]; });
-  },
-
-  flood(msg, excludeId) {
-    // 简单的 TTL 防止无限循环
-    if(msg.ttl <= 0) return;
-    msg.ttl -= 1;
     
-    Object.keys(this.conns).forEach(tid => {
-      if(tid === excludeId) return;
-      const c = this.conns[tid];
-      if(!c.open) return;
+    conn.on('open', () => {
+      this.conns[pid] = conn;
+      this.log(`🔗 连接: ${pid.slice(0,6)}`);
+      ui.renderList(); // 刷新列表
       
-      // 路由优化：本宇宙消息不出宇宙，除非你是桥接种子
-      if(msg.target !== 'global' && c.shard !== this.myShard && c.shard !== -1) return;
+      // 握手
+      conn.send({t: 'HELLO', name: this.myName});
       
-      try { c.conn.send(msg); } catch(e){}
+      // 如果我是主机，把别人介绍给他 (简单的路由发现)
+      if(this.isMaster) {
+        const others = Object.keys(this.conns).filter(id => id !== pid);
+        if(others.length) conn.send({t: 'PEERS', list: others});
+      }
+    });
+
+    conn.on('data', d => this.handleData(pid, d));
+    
+    conn.on('close', () => {
+      delete this.conns[pid];
+      ui.renderList();
+    });
+    
+    conn.on('error', () => {
+      delete this.conns[pid];
+      ui.renderList();
     });
   },
 
-  send(txt) {
-    if(!txt) return;
-    // 默认发给本宇宙
-    const msg = {
-      t: 'MSG', 
-      txt, 
-      n: this.myName, 
-      id: Date.now()+Math.random(), 
-      shard: this.myShard,
-      target: 'local', // or 'global'
-      ttl: 10 
-    };
-    ui.addMsg('我', txt, true, this.myShard);
-    this.flood(msg, null);
-  },
+  // ====== 消息处理核心 (修复刷屏的关键) ======
+  handleData(fromId, d) {
+    // 1. 基础握手
+    if(d.t === 'HELLO') {
+      if(this.conns[fromId]) this.conns[fromId].label = d.name;
+      ui.renderList();
+      return;
+    }
+    
+    // 2. 节点发现
+    if(d.t === 'PEERS' && Array.isArray(d.list)) {
+      d.list.forEach(id => this.connectTo(id));
+      return;
+    }
 
-  maintainNetwork() {
-    if(!this.peer || this.peer.destroyed) return;
-    // 掉线重连种子
-    if (Object.keys(this.conns).length < 2) {
-      ['alpha', 'beta', 'gamma'].forEach(suffix => {
-        this.connectTo(`${SEED_PREFIX}${this.myShard}-${suffix}`);
-      });
+    // 3. 聊天消息 (重点修复)
+    if(d.t === 'MSG') {
+      // ⚡️ 关键：去重检查 ⚡️
+      if(this.seen.has(d.id)) return; // 见过？丢弃！
+      this.seen.add(d.id);            // 没见过？记录！
+      
+      // UI 显示
+      ui.appendMsg(d.sender, d.txt, false);
+      
+      // ⚡️ 关键：转发 (Flood) ⚡️
+      // 规则：转发给所有连接，但【排除】发送给我的那个人
+      this.broadcast(d, fromId);
     }
   },
-  
-  broadcastStats() {
-    // 估算本宇宙在线：我的直连 * 扩散系数 (伪科学，但能看)
-    const myCount = Object.keys(this.conns).filter(k => this.conns[k].shard === this.myShard).length + 1;
-    const msg = {t:'STATS', fromShard: this.myShard, count: myCount, ttl: 5};
-    this.flood(msg, null);
+
+  // 发送/转发函数
+  broadcast(packet, excludeId = null) {
+    Object.keys(this.conns).forEach(pid => {
+      if (pid === excludeId) return; // 绝不发回来源
+      const conn = this.conns[pid];
+      if (conn && conn.open) {
+        try { conn.send(packet); } catch(e){}
+      }
+    });
+  },
+
+  sendText(txt) {
+    if(!txt) return;
+    const id = Date.now() + '-' + Math.random().toString(36).substr(2,5);
+    const packet = { t: 'MSG', id: id, txt: txt, sender: this.myName };
+    
+    // 自己也要记录指纹，防止回路回来
+    this.seen.add(id);
+    
+    // UI 显示
+    ui.appendMsg('我', txt, true);
+    
+    // 发送给所有人
+    this.broadcast(packet, null);
+  },
+
+  cleanup() {
+    // 移除已断开的连接对象
+    Object.keys(this.conns).forEach(pid => {
+      if(!this.conns[pid].open) delete this.conns[pid];
+    });
+    // 没连上主节点？重试
+    if(!this.isMaster && !this.conns[MASTER_ID]) {
+      this.connectTo(MASTER_ID);
+    }
+    ui.renderList();
   },
   
-  getTotalOnline() {
-    let sum = 0;
-    for(let s=0; s<SHARD_COUNT; s++) sum += (this.shardStats[s] || 0);
-    return Math.max(sum, Object.keys(this.conns).length + 1);
+  // 简易文件发送 (直连)
+  sendFile(file, targetId) {
+    // 暂略，确保聊天先通
+    alert('当前版本优先保证聊天稳定，请先测试文字');
   }
 };
 
@@ -233,64 +206,75 @@ const ui = {
   init() {
     document.getElementById('btnSend').onclick = () => {
       const el = document.getElementById('editor');
-      app.send(el.innerText);
+      app.sendText(el.innerText);
       el.innerText = '';
     };
+    
+    // 侧边栏
     document.getElementById('btnBack').onclick = () => {
       document.getElementById('sidebar').classList.remove('hidden');
     };
-    setInterval(() => this.render(), 2000);
+    
+    // 初始状态
+    this.updateSelf();
+    this.renderList();
   },
 
-  render() {
-    document.getElementById('myId').innerText = app.myId ? app.myId.slice(0,8) : '...';
-    document.getElementById('statusText').innerText = `宇宙 #${app.myShard} | ${app.isSeed?'守护者':'居民'}`;
+  updateSelf() {
+    document.getElementById('myId').innerText = app.myId ? app.myId.slice(0,6) : '...';
+    document.getElementById('statusText').innerText = app.isMaster ? '👑 主机' : '在线';
     document.getElementById('statusDot').className = 'dot ' + (app.myId ? 'online':'');
-    this.updateGlobalCount();
+  },
 
+  // 实时重新渲染列表 (修复虚节点)
+  renderList() {
     const list = document.getElementById('contactList');
     list.innerHTML = `
-      <div class="contact-item active">
-        <div class="avatar" style="background:#2a7cff">#${app.myShard}</div>
-        <div class="c-info">
-          <div class="c-name">本宇宙频道</div>
-          <div class="c-msg">仅限分片 ${app.myShard} 内通信</div>
-        </div>
+      <div class="contact-item active" onclick="ui.toggleSidebar()">
+        <div class="avatar" style="background:#2a7cff">全</div>
+        <div class="c-info"><div class="c-name">公共频道</div><div class="c-msg">全员广播</div></div>
       </div>
     `;
     
-    // 显示直连节点
+    const count = Object.keys(app.conns).length;
+    document.getElementById('onlineCount').innerText = count + ' 连接';
+
     Object.keys(app.conns).forEach(pid => {
       const c = app.conns[pid];
-      if(!c.open) return;
-      const isAlien = c.shard !== app.myShard;
+      const name = c.label || pid.slice(0,6);
+      const isMaster = (pid === MASTER_ID);
+      
       list.innerHTML += `
-        <div class="contact-item" style="opacity:0.7">
-          <div class="avatar" style="background:${isAlien?'#purple':'#333'}">${isAlien?'👽':'👤'}</div>
-          <div class="c-info"><div class="c-name">${c.label} ${isAlien?('(宇宙 '+c.shard+')'):''}</div></div>
-        </div>`;
+        <div class="contact-item">
+          <div class="avatar" style="background:${isMaster?'#ff9f00':'#333'}">${name[0]}</div>
+          <div class="c-info">
+            <div class="c-name">${name} ${isMaster?'(主机)':''}</div>
+            <div class="c-msg">ID: ${pid.slice(0,6)}</div>
+          </div>
+        </div>
+      `;
     });
   },
-  
-  updateGlobalCount() {
-    document.getElementById('onlineCount').innerText = app.getTotalOnline() + ' 节点在线';
-  },
 
-  addMsg(name, txt, isMe, shardId) {
+  appendMsg(name, txt, isMe) {
     const box = document.getElementById('msgList');
     const d = document.createElement('div');
     d.className = `msg-row ${isMe?'me':'other'}`;
-    const tag = (shardId !== undefined && shardId !== app.myShard) ? `[来自宇宙 ${shardId}] ` : '';
     d.innerHTML = `
-      <div style="max-width:80%">
-        <div class="msg-bubble">${tag}${txt}</div>
+      <div style="max-width:85%">
+        <div class="msg-bubble">${txt}</div>
         ${!isMe ? `<div class="msg-meta">${name}</div>` : ''}
       </div>`;
     box.appendChild(d);
     box.scrollTop = box.scrollHeight;
+  },
+  
+  toggleSidebar() {
+    if(window.innerWidth < 768) document.getElementById('sidebar').classList.add('hidden');
   }
 };
 
+// 启动
 window.app = app;
 window.ui = ui;
 ui.init();

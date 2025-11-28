@@ -1,7 +1,7 @@
 (function(){
 'use strict';
 
-// ===================== 配置 =====================
+// ===================== 强壮配置 =====================
 const SIGNAL_SERVERS = [
   {host:'peerjs.92k.de', port:443, secure:true, path:'/'},
   {host:'0.peerjs.com', port:443, secure:true, path:'/'}
@@ -11,469 +11,394 @@ const ICE = [
   {urls:'stun:stun.miwifi.com:3478'},
   {urls:'stun:global.stun.twilio.com:3478'}
 ];
-const MAX_PEERS = 15;
-const CHUNK_SIZE = 64 * 1024; 
+const MAX_PEERS = 20;
+const HUB_ID = 'p1-hub-v4'; // 升级版本
 
-// 🔥 固定种子 ID (接待员 ID)
-const PUBLIC_HUB_ID = 'p1-hub-v3'; // 升级版本号，避开旧缓存
-
-// ===================== 核心逻辑 (Mesh Core) =====================
+// ===================== 核心逻辑 =====================
 const app = {
   localId: localStorage.getItem('p1_id') || '',
   myName: localStorage.getItem('nickname') || ('User-'+Math.random().toString(36).substr(2,4)),
-  conns: {}, 
-  peer: null,
-  serverIdx: 0,
-  knownPeers: new Set(JSON.parse(localStorage.getItem('p1_peers')||'[]')),
-  isHub: false,
   
-  seenMsgIds: new Set(),
-  fileChunks: {},
+  peer: null,
+  conns: {}, // pid -> {conn, state, lastPing, name}
+  // state: 'connecting' | 'connected' | 'dead'
+  
+  // 🔥 永久存储
+  msgs: JSON.parse(localStorage.getItem('p1_msgs') || '{}'), // pid -> [msgObj]
+  
+  // 内部状态
+  serverIdx: 0,
+  isHub: false,
+  restarting: false,
   
   // UI 接口
-  onStatus: null, 
-  onMsg: null,
-  onContactUpdate: null,
-  onFileProgress: null,
+  onUpdate: null, // 合并所有 UI 更新通知
 
   log(s) {
-    console.log('[Mesh]', s);
+    console.log(s);
     const el = document.getElementById('miniLog');
-    if(el) { el.innerText += s+'\n'; el.scrollTop=el.scrollHeight; }
+    if(el) { el.innerText = s + '\n' + el.innerText; } // 新日志在顶部
   },
 
   init() {
-    this.connect();
-    setInterval(() => this.keepAlive(), 5000);
-    setInterval(() => { if(this.seenMsgIds.size > 5000) this.seenMsgIds.clear(); }, 60000);
+    this.start();
+    
+    // 5秒一次大检查
+    setInterval(() => this.watchdog(), 5000);
+    
+    // 页面切回前台时，如果断网了，立刻重连
     document.addEventListener('visibilitychange', () => {
-      if(document.visibilityState==='visible' && !this.peer) this.connect();
+      if(document.visibilityState === 'visible' && (!this.peer || this.peer.disconnected)) {
+        this.log('👀 唤醒重连...');
+        this.start();
+      }
     });
   },
 
-  connect(forceId = null) {
-    if(this.peer) return;
+  // 启动/重启流程
+  start(forceHub = false) {
+    if(this.restarting) return;
+    this.restarting = true;
+
+    // 清理旧身
+    if(this.peer) { try{this.peer.destroy();}catch(e){} this.peer=null; }
+    
     const srv = SIGNAL_SERVERS[this.serverIdx];
-    this.log(`启动连接 ${srv.host}...`);
-    
+    this.log(`正在连接 ${srv.host}...`);
+
+    // 决定 ID：如果是强制 Hub，则用 Hub ID；否则用本地 ID；没有则 undefined (随机)
+    let myId = forceHub ? HUB_ID : (this.localId || undefined);
+    // 如果本地存的是 Hub ID 但现在没强制 Hub，说明上次我是 Hub，这次也尽量保持
+    if(!forceHub && this.localId === HUB_ID) myId = HUB_ID;
+
     try {
-      const opts = { 
+      const p = new Peer(myId, {
         host: srv.host, port: srv.port, secure: srv.secure, path: srv.path,
-        config: { iceServers: ICE }, debug: 1
-      };
-      
-      // 优先策略：如果有强制ID则用，否则用本地缓存，最后随机
-      let idToUse = forceId || this.localId || undefined;
-      if(forceId === PUBLIC_HUB_ID) idToUse = PUBLIC_HUB_ID;
+        config: { iceServers: ICE }, debug: 1,
+        pingInterval: 5000 // PeerJS 内部心跳
+      });
 
-      this.peer = new Peer(idToUse, opts);
-    } catch(e) { this.nextServer(); return; }
+      p.on('open', id => {
+        this.restarting = false;
+        this.localId = id;
+        this.isHub = (id === HUB_ID);
+        if(!this.isHub) localStorage.setItem('p1_id', id); // 只有普通 ID 才存，防止 Hub ID 污染
+        
+        this.log(`✅ 成功: ${this.isHub?'👑 接待员':'👤 节点'} (${id.slice(0,6)})`);
+        this.requestWakeLock();
+        this.notifyUI();
 
-    this.peer.on('open', id => {
-      if(id !== PUBLIC_HUB_ID) localStorage.setItem('p1_id', id);
-      this.localId = id;
-      this.isHub = (id === PUBLIC_HUB_ID);
-      
-      this.log(`✅ ID: ${id} ${this.isHub ? '(👑 接待员)' : ''}`);
-      this.updateStatus();
-      this.requestWakeLock();
-      
-      if (this.isHub) {
-        // 我是接待员：坐等连接
-      } else {
-        // 我是普通人：立刻寻找接待员
-        this.checkHubStatus(); 
-        // 同时回拨老朋友
-        this.knownPeers.forEach(pid => { if(pid !== PUBLIC_HUB_ID) this.dial(pid); });
-      }
-    });
-
-    this.peer.on('connection', conn => this.setupConn(conn, true));
-    
-    this.peer.on('error', err => {
-      if(err.type === 'unavailable-id') {
-        // ID冲突（通常发生在争抢 Hub 时）
-        if (this.localId === PUBLIC_HUB_ID || !this.localId) {
-           this.log('👑 接待员席位已满，转为普通节点...');
-           localStorage.removeItem('p1_id');
-           this.localId = ''; // 清空 ID，让 PeerJS 随机生成
-           if(this.peer) this.peer.destroy();
-           this.peer = null;
-           setTimeout(() => this.connect(), 200); // 极速重连
+        // 业务启动
+        if(!this.isHub) {
+          this.dial(HUB_ID); // 找接待员
+          this.reconnectKnown(); // 找老朋友
         }
-      }
-      else if(['network','server-error','socket-error'].includes(err.type)) {
-        this.log('网络故障，切换线路...');
-        this.nextServer();
-      }
-    });
-    
-    this.peer.on('disconnected', () => { if(this.peer) this.peer.reconnect(); });
-    this.peer.on('close', () => { this.peer = null; this.updateStatus(); });
+      });
+
+      p.on('connection', conn => this.handleIncoming(conn));
+      
+      p.on('error', err => {
+        this.restarting = false;
+        this.log(`⚠️ ${err.type}`);
+        
+        if(err.type === 'unavailable-id') {
+          // ID 冲突：如果你想当 Hub 被拒了，说明 Hub 活着，那你就当普通人
+          if(myId === HUB_ID) {
+            this.log('👑 接待员席位已满，转为普通人');
+            this.localId = ''; // 清空 ID 让系统生成新的
+            localStorage.removeItem('p1_id');
+            setTimeout(() => this.start(false), 500);
+          }
+        } 
+        else if(err.type === 'peer-unavailable') {
+          // 找不到人：如果是找 Hub 找不到，那就自己上位
+          if(err.message.includes(HUB_ID)) {
+            this.log('🚨 接待员缺席，正在上位...');
+            this.start(true); // 强制成为 Hub
+          }
+        }
+        else if(['network','server-error','socket-error'].includes(err.type)) {
+          this.serverIdx = (this.serverIdx + 1) % SIGNAL_SERVERS.length;
+          setTimeout(() => this.start(), 2000);
+        }
+      });
+
+      p.on('disconnected', () => { 
+        // 仅仅是信令断了，连接可能还在，尝试重连信令
+        if(!this.restarting) p.reconnect(); 
+      });
+
+      this.peer = p;
+
+    } catch(e) {
+      this.restarting = false;
+      this.log('启动失败:' + e.message);
+      setTimeout(() => this.start(), 3000);
+    }
   },
 
-  // 🔥 激进的篡位逻辑
-  checkHubStatus() {
-    // 尝试连接 Hub
-    const conn = this.peer.connect(PUBLIC_HUB_ID, {reliable:true});
-    
-    // 2秒倒计时：如果 Hub 没反应，我就是 Hub
-    const timer = setTimeout(() => {
-      if (!this.conns[PUBLIC_HUB_ID] || !this.conns[PUBLIC_HUB_ID].open) {
-        this.log('🚨 接待员缺席，正在上位...');
-        this.becomeHub();
-      }
-    }, 2000);
-
-    conn.on('open', () => {
-      clearTimeout(timer); // Hub 活着，取消篡位
-      this.setupConn(conn, false);
-    });
-    
-    // 监听 PeerJS 的报错（如果找不到 Hub 会立即报错）
-    this.peer.on('error', err => {
-      if(err.type === 'peer-unavailable' && err.message.includes(PUBLIC_HUB_ID)) {
-        clearTimeout(timer);
-        this.log('🚨 没找到接待员，正在上位...');
-        this.becomeHub();
-      }
-    });
-  },
-
-  becomeHub() {
-    if(this.peer) { this.peer.destroy(); this.peer = null; }
-    setTimeout(() => this.connect(PUBLIC_HUB_ID), 500);
-  },
-
-  nextServer() {
-    if(this.peer) { this.peer.destroy(); this.peer = null; }
-    this.serverIdx = (this.serverIdx + 1) % SIGNAL_SERVERS.length;
-    setTimeout(() => this.connect(), 1000);
-  },
-
+  // 拨号
   dial(pid) {
-    if(pid === this.localId || (this.conns[pid] && this.conns[pid].open)) return;
-    if(Object.keys(this.conns).length >= MAX_PEERS) return;
-    if(!this.peer) return;
+    if(pid === this.localId || (this.conns[pid] && this.conns[pid].state === 'connected')) return;
+    if(!this.peer || this.peer.destroyed) return;
     
-    const conn = this.peer.connect(pid, {reliable: true});
+    const conn = this.peer.connect(pid, {reliable: true, serialization: 'json'});
     this.setupConn(conn, false);
   },
 
+  // 处理入站
+  handleIncoming(conn) {
+    this.setupConn(conn, true);
+  },
+
+  // 连接设置 & 握手
   setupConn(conn, isIncoming) {
     const pid = conn.peer;
-    const cObj = { conn, open: false, name: shortId(pid), lastPing: Date.now() };
-    this.conns[pid] = cObj;
+    const c = { 
+      conn, 
+      state: 'connecting', 
+      lastPing: Date.now(), 
+      name: pid.slice(0,6) 
+    };
+    this.conns[pid] = c;
 
     conn.on('open', () => {
-      cObj.open = true;
-      this.remember(pid);
-      conn.send({type:'hello', name: this.myName});
-      
-      // 接待员广播逻辑
-      if (this.isHub) {
-        const others = Object.keys(this.conns).filter(id => id !== pid && this.conns[id].open);
-        if(others.length) conn.send({type:'peers', list: others});
+      // 握手第一步：发送身份
+      conn.send({t: 'HELLO', name: this.myName});
+      // 如果我是 Hub，把别人介绍给他
+      if(this.isHub) {
+        const list = Object.keys(this.conns).filter(id => id!==pid && this.conns[id].state==='connected');
+        if(list.length) conn.send({t: 'PEERS', list});
       }
-      this.updateStatus();
     });
 
-    conn.on('data', d => this.handleData(pid, d));
-    conn.on('close', () => { delete this.conns[pid]; this.updateStatus(); });
-    conn.on('error', () => { delete this.conns[pid]; this.updateStatus(); });
-  },
-
-  handleData(pid, d) {
-    const c = this.conns[pid];
-    if(!c) return;
-    c.lastPing = Date.now();
-
-    if(d.type === 'hello') {
-      c.name = d.name;
-      this.updateStatus();
-    }
-    else if(d.type === 'peers') {
-      if (Array.isArray(d.list)) {
-        this.log(`收到推荐节点: ${d.list.length}个`);
+    conn.on('data', d => {
+      c.lastPing = Date.now();
+      
+      if(d.t === 'HELLO') {
+        c.name = d.name;
+        c.state = 'connected'; // 握手完成
+        this.log((isIncoming?'📥':'📤') + ` 连通: ${d.name}`);
+        this.remember(pid);
+        this.notifyUI();
+        
+        // 握手回执 (ACK) - 解决半开连接
+        conn.send({t: 'HELLO_ACK'});
+      }
+      else if(d.t === 'HELLO_ACK') {
+        c.state = 'connected';
+        this.notifyUI();
+      }
+      else if(d.t === 'PEERS') {
         d.list.forEach(id => this.dial(id));
       }
+      else if(d.t === 'MSG') {
+        this.saveMsg(pid, d.text, false, d.name);
+        this.notifyUI();
+      }
+      else if(d.t === 'FILE_CHUNK') {
+        // 简化文件处理：直接提示
+        this.saveMsg(pid, `[收到文件数据 ${d.curr}/${d.total}]`, false, d.name);
+        this.notifyUI();
+      }
+    });
+
+    conn.on('close', () => { this.closeConn(pid); });
+    conn.on('error', () => { this.closeConn(pid); });
+  },
+
+  closeConn(pid) {
+    if(this.conns[pid]) {
+      // this.log(`断开: ${shortId(pid)}`);
+      delete this.conns[pid];
+      this.notifyUI();
     }
-    else if(d.type === 'chat') {
-      if(this.seenMsgIds.has(d.id)) return; 
-      this.seenMsgIds.add(d.id);
-      if(this.onMsg) this.onMsg(d.from, d.text, 'text', d.senderName);
-      this.flood(d, pid); 
+  },
+
+  // 看门狗：检测死链、断网
+  watchdog() {
+    const now = Date.now();
+    // 1. 检查信令
+    if(this.peer && this.peer.disconnected && !this.restarting) {
+      this.peer.reconnect();
     }
-    else if(d.type === 'file-start') {
-      this.fileChunks[d.fileId] = { meta: d.meta, buffer: [], received: 0, lastUpdate: Date.now() };
-      if(this.onMsg) this.onMsg(pid, `正在接收文件: ${d.meta.name} (${humanSize(d.meta.size)})...`, 'sys');
-    }
-    else if(d.type === 'file-chunk') {
-      const f = this.fileChunks[d.fileId];
-      if(f) {
-        f.buffer.push(d.data);
-        f.received += d.data.byteLength;
-        f.lastUpdate = Date.now();
-        if(f.received >= f.meta.size) {
-          const blob = new Blob(f.buffer, {type: f.meta.type});
-          const url = URL.createObjectURL(blob);
-          if(this.onMsg) this.onMsg(pid, `<a href="${url}" download="${f.meta.name}" style="color:#4ade80">📄 ${f.meta.name} 下载完成</a>`, 'file');
-          delete this.fileChunks[d.fileId];
+    
+    // 2. 检查节点心跳
+    Object.keys(this.conns).forEach(pid => {
+      const c = this.conns[pid];
+      if(now - c.lastPing > 15000) { // 15秒没动静
+        if(c.state === 'connected') {
+           // 尝试发 Ping
+           try { c.conn.send({t: 'PING'}); } catch(e) { this.closeConn(pid); }
+        } else if (now - c.lastPing > 30000) {
+           // 连了30秒还是 connecting? 杀。
+           this.closeConn(pid);
         }
       }
-    }
-  },
-
-  flood(msg, excludePid) {
-    const payload = JSON.stringify(msg);
-    Object.entries(this.conns).forEach(([targetId, c]) => {
-      if(c.open && targetId !== excludePid) {
-        try { c.conn.send(msg); } catch(e){}
-      }
     });
-  },
 
-  sendChat(text, targetPid) {
-    const msgId = Date.now() + '-' + Math.random().toString(36).substr(2,5);
-    const msg = {
-      type: 'chat', id: msgId, text: text,
-      from: this.localId, senderName: this.myName, target: targetPid
-    };
-    this.seenMsgIds.add(msgId);
-
-    if(targetPid === 'all') {
-      this.flood(msg, null);
-    } else {
-      const c = this.conns[targetPid];
-      if(c && c.open) c.conn.send(msg);
-      else {
-        this.dial(targetPid);
-        setTimeout(() => {
-           const c2 = this.conns[targetPid];
-           if(c2 && c2.open) c2.conn.send(msg);
-           else if(this.onMsg) this.onMsg(null, '发送失败：未连接到对方', 'sys');
-        }, 2000);
-      }
+    // 3. 没接待员？重试
+    if(!this.isHub && !this.conns[HUB_ID] && !this.restarting) {
+      this.dial(HUB_ID);
     }
   },
 
-  sendFile(file, targetPid) {
-    if(targetPid === 'all') {
-      alert('为防止网络拥堵，请在侧边栏点击好友头像进行私聊传文件。');
-      return false;
-    }
-    const c = this.conns[targetPid];
-    if(!c || !c.open) {
-      this.dial(targetPid);
-      alert('正在建立直连通道，请稍后再试...');
-      return false;
-    }
-
-    const fileId = Date.now() + '-' + Math.random().toString(36).substr(2,5);
-    const meta = { name: file.name, size: file.size, type: file.type };
-    c.conn.send({ type: 'file-start', fileId, meta });
-
-    let offset = 0;
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      if(c.open) {
-        c.conn.send({ type: 'file-chunk', fileId: fileId, data: e.target.result });
-        offset += e.target.result.byteLength;
-        if(offset < file.size) readNext();
-        else if(this.onMsg) this.onMsg(null, `文件 ${file.name} 发送完毕`, 'sys');
-      }
-    };
-    const readNext = () => {
-      const slice = file.slice(offset, offset + CHUNK_SIZE);
-      reader.readAsArrayBuffer(slice);
-    };
-    readNext();
-  },
-
-  keepAlive() {
-    if(!this.peer) return;
-    const now = Date.now();
+  // 发送消息
+  send(text, targetId) {
+    const msg = {t: 'MSG', text, name: this.myName, id: Date.now()};
     
-    // 只有当我不是 Hub，且我没连上 Hub 时，才疯狂重试连接 Hub
-    if (!this.isHub && !this.conns[PUBLIC_HUB_ID]?.open) {
-       // 这里不做操作，依赖 init 里的重试或手动触发
-    }
+    // 存自己的
+    this.saveMsg(targetId, text, true, '我');
 
-    Object.entries(this.conns).forEach(([pid, c]) => {
-      if(!c.open) return;
-      if(now - c.lastPing > 4000) c.conn.send({type:'ping'});
-      if(now - c.lastPing > 30000) { c.conn.close(); delete this.conns[pid]; }
-    });
+    if(targetId === 'all') {
+      // 群发
+      Object.values(this.conns).forEach(c => {
+        if(c.state === 'connected') c.conn.send(msg);
+      });
+    } else {
+      // 私聊
+      const c = this.conns[targetId];
+      if(c && c.state === 'connected') {
+        c.conn.send(msg);
+      } else {
+        this.saveMsg(targetId, '[发送失败: 未连接]', true, '系统');
+        this.dial(targetId); // 尝试重连
+      }
+    }
+    this.notifyUI();
   },
 
+  // 保存消息到本地存储
+  saveMsg(pid, text, isMe, senderName) {
+    if(!this.msgs[pid]) this.msgs[pid] = [];
+    this.msgs[pid].push({
+      txt: text, 
+      me: isMe, 
+      name: senderName, 
+      time: Date.now()
+    });
+    // 限制历史记录长度 50 条
+    if(this.msgs[pid].length > 50) this.msgs[pid].shift();
+    localStorage.setItem('p1_msgs', JSON.stringify(this.msgs));
+  },
+
+  // 辅助
   remember(pid) {
-    if(pid === PUBLIC_HUB_ID) return;
-    this.knownPeers.add(pid);
-    if(this.knownPeers.size > 50) {
-      const it = this.knownPeers.values();
-      this.knownPeers.delete(it.next().value);
+    if(pid === HUB_ID) return;
+    let list = JSON.parse(localStorage.getItem('p1_peers')||'[]');
+    if(!list.includes(pid)) {
+      list.push(pid);
+      if(list.length > 10) list.shift();
+      localStorage.setItem('p1_peers', JSON.stringify(list));
     }
-    localStorage.setItem('p1_peers', JSON.stringify([...this.knownPeers]));
   },
-
-  updateStatus() {
-    if(this.onStatus) this.onStatus({
-      id: this.localId,
-      online: Object.keys(this.conns).filter(k => this.conns[k].open).length,
-      connected: !!this.peer && !this.peer.disconnected,
-      isHub: this.isHub
-    });
-    if(this.onContactUpdate) this.onContactUpdate(this.conns);
+  
+  reconnectKnown() {
+    let list = JSON.parse(localStorage.getItem('p1_peers')||'[]');
+    list.forEach(pid => this.dial(pid));
   },
 
   requestWakeLock() {
     if('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(()=>{});
+  },
+
+  notifyUI() {
+    if(this.onUpdate) this.onUpdate();
   }
 };
 
-// ===================== 界面逻辑 (UI) =====================
+// ===================== UI =====================
 const ui = {
-  activeChat: 'all', 
-  
+  active: 'all',
   init() {
-    this.bindEvents();
-    app.onStatus = s => {
-      $('#myId').innerText = shortId(s.id);
-      const role = s.isHub ? '👑 接待员' : '普通节点';
-      $('#statusText').innerText = s.connected ? `在线 (${role})` : '离线';
-      $('#statusDot').className = 'dot ' + (s.connected ? 'online':'');
-      $('#onlineCount').innerText = `${s.online} 邻居`;
-      $('#myNick').innerText = app.myName;
+    app.onUpdate = () => this.render();
+    
+    // 绑定事件
+    const $ = s => document.querySelector(s);
+    $('#btnSend').onclick = () => {
+      const txt = $('#editor').innerText.trim();
+      if(txt) { app.send(txt, this.active); $('#editor').innerText=''; }
     };
     
-    app.onContactUpdate = conns => this.renderContacts(conns);
-    
-    app.onMsg = (fromId, text, type, senderName) => {
-      if(this.activeChat === 'all' || this.activeChat === fromId) {
-         const name = senderName || (app.conns[fromId]?.name) || shortId(fromId);
-         const isHtml = type === 'file';
-         this.appendMsg(name, text, false, type==='sys', isHtml);
-      }
-    };
-
-    app.init();
+    // 定期刷新UI (时间戳)
+    setInterval(() => this.render(), 3000);
   },
 
-  bindEvents() {
-    $('#btnSend').onclick = () => this.doSend();
-    $('#editor').onkeydown = e => { if(e.key==='Enter' && !e.shiftKey) { e.preventDefault(); this.doSend(); } };
-    $('#btnBack').onclick = () => { $('#sidebar').classList.remove('hidden'); };
-    $('#btnSettings').onclick = () => $('#settings-panel').style.display='grid';
-    $('#btnCloseSettings').onclick = () => $('#settings-panel').style.display='none';
+  render() {
+    const $ = s => document.querySelector(s);
     
-    $('#btnFile').onclick = () => $('#fileInput').click();
-    $('#fileInput').onchange = (e) => {
-      const file = e.target.files[0];
-      if(file) {
-        if(app.sendFile(file, this.activeChat) !== false) { 
-           this.appendMsg('我', `正在发送文件 ${file.name}...`, true, true);
-        }
-        e.target.value = ''; 
-      }
-    };
-
-    $('#btnSave').onclick = () => {
-      const nick = $('#iptNick').value.trim();
-      if(nick) { app.myName = nick; localStorage.setItem('nickname', nick); }
-      const peer = $('#iptPeer').value.trim();
-      if(peer) app.dial(peer);
-      $('#settings-panel').style.display='none';
-      app.updateStatus();
-    };
-    $('#iptNick').value = app.myName;
-    $('#btnToggleLog').onclick = () => {
-      const el = $('#miniLog');
-      el.style.display = el.style.display==='block' ? 'none' : 'block';
-    };
-  },
-
-  renderContacts(conns) {
+    // 1. 自身状态
+    $('#myId').innerText = app.localId ? app.localId.slice(0,6) : '...';
+    $('#statusText').innerText = app.peer && !app.peer.disconnected ? '在线' : '连接中';
+    $('#statusDot').className = 'dot ' + (app.peer && !app.peer.disconnected ? 'online' : '');
+    
+    // 2. 联系人列表
     const list = $('#contactList');
     let html = `
-      <div class="contact-item ${this.activeChat==='all'?'active':''}" onclick="ui.switchChat('all')">
+      <div class="contact-item ${this.active==='all'?'active':''}" onclick="ui.switch('all')">
         <div class="avatar" style="background:#2a7cff">全</div>
-        <div class="c-info">
-          <div class="c-top"><div class="c-name">公共频道</div></div>
-          <div class="c-msg">Mesh 全网广播</div>
-        </div>
+        <div class="c-info"><div class="c-name">公共频道</div></div>
       </div>
     `;
     
-    Object.entries(conns).forEach(([pid, c]) => {
-      if(!c.open) return;
-      const isHub = (pid === PUBLIC_HUB_ID);
-      const tag = isHub ? '👑 ' : '';
+    // 合并“当前连接”和“历史记录”
+    let allPeers = new Set([...Object.keys(app.conns), ...Object.keys(app.msgs)]);
+    allPeers.forEach(pid => {
+      if(pid === 'all' || pid === app.localId) return;
+      const c = app.conns[pid];
+      const isOnline = c && c.state === 'connected';
+      const name = c ? c.name : (pid===HUB_ID?'👑 接待员':pid.slice(0,6));
       
       html += `
-        <div class="contact-item ${this.activeChat===pid?'active':''}" onclick="ui.switchChat('${pid}')">
-          <div class="avatar" style="background:#1f2937">${c.name[0]}</div>
+        <div class="contact-item ${this.active===pid?'active':''}" onclick="ui.switch('${pid}')">
+          <div class="avatar" style="background:${isOnline?'#22c55e':'#666'}">${name[0]}</div>
           <div class="c-info">
             <div class="c-top">
-              <div class="c-name">${tag}${c.name}</div>
-              <div class="c-time">${shortId(pid)}</div>
+              <div class="c-name">${name}</div>
+              <div class="c-time">${isOnline?'在线':'离线'}</div>
             </div>
-            <div class="c-msg">直连中</div>
           </div>
         </div>
       `;
     });
     list.innerHTML = html;
-  },
 
-  switchChat(pid) {
-    this.activeChat = pid;
-    $('#chatTitle').innerText = pid==='all' ? '公共频道 (Mesh)' : (app.conns[pid]?.name || pid);
-    $('#msgList').innerHTML = '<div class="sys-msg">切换会话</div>';
-    if(window.innerWidth < 768) $('#sidebar').classList.add('hidden');
-    this.renderContacts(app.conns);
-  },
-
-  doSend() {
-    const el = $('#editor');
-    const txt = el.innerText.trim();
-    if(!txt) return;
+    // 3. 消息列表
+    const msgBox = $('#msgList');
+    const msgs = app.msgs[this.active] || [];
     
-    app.sendChat(txt, this.activeChat);
-    this.appendMsg('我', txt, true);
-    el.innerText = '';
+    // 简单的差异更新（防止闪烁）
+    if(msgBox.childElementCount !== msgs.length + 1) { // +1 是系统欢迎语
+      msgBox.innerHTML = '<div class="sys-msg">加密连接已建立</div>';
+      msgs.forEach(m => {
+        const div = document.createElement('div');
+        div.className = `msg-row ${m.me?'me':'other'}`;
+        div.innerHTML = `
+          <div style="max-width:100%">
+            <div class="msg-bubble">${m.txt}</div>
+            ${!m.me ? `<div class="msg-meta">${m.name}</div>` : ''}
+          </div>`;
+        msgBox.appendChild(div);
+      });
+      msgBox.scrollTop = msgBox.scrollHeight;
+    }
+    
+    // 标题
+    $('#chatTitle').innerText = this.active==='all' ? '公共频道' : (app.conns[this.active]?.name || this.active.slice(0,6));
   },
 
-  appendMsg(name, text, isMe, isSys, isHtml) {
-    const list = $('#msgList');
-    const div = document.createElement('div');
-    if(isSys) {
-      div.className = 'sys-msg';
-      div.innerHTML = text; 
-    } else {
-      div.className = `msg-row ${isMe?'me':'other'}`;
-      const content = isHtml ? text : text.replace(/</g,'<').replace(/>/g,'>');
-      div.innerHTML = `
-        <div style="max-width:100%">
-          <div class="msg-bubble">${content}</div>
-          ${!isMe ? `<div class="msg-meta">${name}</div>` : ''}
-        </div>
-      `;
-    }
-    list.appendChild(div);
-    list.scrollTop = list.scrollHeight;
+  switch(pid) {
+    this.active = pid;
+    const msgBox = document.querySelector('#msgList');
+    msgBox.innerHTML = ''; // 强制重绘
+    this.render();
+    if(window.innerWidth < 768) document.querySelector('#sidebar').classList.add('hidden');
   }
 };
 
-function shortId(id){ return (id||'').substr(0,6); }
-function humanSize(bytes) {
-  const k = 1024; if(bytes<k) return bytes+' B';
-  const i = Math.floor(Math.log(bytes)/Math.log(k));
-  return parseFloat((bytes/Math.pow(k,i)).toFixed(1)) + ' ' + ['B','KB','MB','GB'][i];
-}
-const $ = s => document.querySelector(s);
-
-window.ui = ui;
 window.app = app;
+window.ui = ui;
+app.init();
 ui.init();
 
 })();

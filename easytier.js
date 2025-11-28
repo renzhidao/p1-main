@@ -8,9 +8,7 @@ const CONFIG = {
   debug: 0
 };
 
-// 每个人最多维持 8 个直连，多了拒绝，少了去补
 const MAX_NEIGHBORS = 8; 
-// 引导节点池（种子）：仅用于初次进入网络，连上后就不再依赖它们
 const SEEDS = ['p1-s1', 'p1-s2', 'p1-s3']; 
 
 // ===================== 核心逻辑 =====================
@@ -18,11 +16,12 @@ const app = {
   myId: '',
   myName: localStorage.getItem('nickname') || 'User-'+Math.floor(Math.random()*10000),
   peer: null,
-  conns: {}, // 活跃连接: pid -> conn
-  knownPeers: new Set(), // 知道但不一定连着的节点池
-  seenMsgs: new Set(), // 消息去重指纹
+  conns: {}, 
+  knownPeers: new Set(), 
+  seenMsgs: new Set(), 
   
-  // 日志
+  isSeed: false, // 标记自己是否变成了种子
+
   log(s) {
     const el = document.getElementById('miniLog');
     if(el) el.innerText = `[${new Date().toLocaleTimeString()}] ${s}\n` + el.innerText.slice(0, 300);
@@ -31,11 +30,11 @@ const app = {
   init() {
     this.start();
     
-    // 🕸️ 网络维护进程
+    // 🕸️ 网络维护
     setInterval(() => {
-      this.cleanup();        // 清理死链
-      this.fillSlots();      // 缺人补人
-      this.exchangePeers();  // 交换通讯录
+      this.cleanup();
+      this.fillSlots();
+      this.exchangePeers();
     }, 5000);
     
     // 指纹清理
@@ -45,41 +44,68 @@ const app = {
   start() {
     if(this.peer) return;
     
-    // 随机尝试抢占一个种子位，抢不到就做普通节点
-    // 这样保证网络里总有几个固定的入口 ID 存在
-    const seedIndex = Math.floor(Math.random() * SEEDS.length);
-    const tryId = (Math.random() > 0.5) ? SEEDS[seedIndex] : undefined; // 50%概率尝试当种子
-
-    this.initPeer(tryId);
+    // 初始策略：先做普通人，连连看
+    this.initPeer(undefined); 
+    
+    // 🔥 保底机制：5秒后还是孤家寡人？我去当种子！
+    setTimeout(() => {
+      if (Object.keys(this.conns).length === 0 && !this.isSeed) {
+        this.log('🚨 无人响应，正在强制化身为种子...');
+        this.becomeSeed();
+      }
+    }, 5000);
   },
 
-  initPeer(id) {
-    const p = new Peer(id, CONFIG);
+  // 尝试变身为种子（轮询 SEEDS 列表）
+  becomeSeed(index = 0) {
+    if (index >= SEEDS.length) {
+      this.log('⚠️ 所有种子位均被占，保持普通身份重试...');
+      this.initPeer(undefined); // 回退为普通人
+      return;
+    }
     
-    p.on('open', myId => {
-      this.myId = myId;
-      this.peer = p;
-      this.log(`✅ 上线: ${myId.slice(0,6)}`);
-      ui.updateSelf();
+    if (this.peer) this.peer.destroy();
+    this.initPeer(SEEDS[index], index); // 尝试第 index 个种子 ID
+  },
+
+  initPeer(id, seedIndex = null) {
+    try {
+      const p = new Peer(id, CONFIG);
       
-      // 刚上线，先连种子节点混个脸熟
-      SEEDS.forEach(s => { if(s !== myId) this.connectTo(s); });
-    });
+      p.on('open', myId => {
+        this.myId = myId;
+        this.peer = p;
+        this.isSeed = (seedIndex !== null);
+        this.log(`✅ 上线: ${myId.slice(0,6)} ${this.isSeed ? '(种子)' : ''}`);
+        ui.updateSelf();
+        
+        // 不管我是谁，我都尝试去连所有种子（互相结网）
+        SEEDS.forEach(s => { if(s !== myId) this.connectTo(s); });
+      });
 
-    p.on('error', err => {
-      // 如果种子 ID 被占，说明种子在线，那我做普通人
-      if(err.type === 'unavailable-id') {
-        this.initPeer(undefined); // 重新以随机 ID 启动
-      }
-    });
+      p.on('error', err => {
+        if(err.type === 'unavailable-id') {
+          // 种子 ID 被占了？试试下一个种子位
+          if (seedIndex !== null) {
+            this.becomeSeed(seedIndex + 1);
+          } else {
+            // 普通 ID 被占（极罕见），重试
+            setTimeout(() => this.initPeer(undefined), 1000);
+          }
+        } else {
+          // this.log(`Err: ${err.type}`);
+        }
+      });
 
-    p.on('connection', conn => this.handleConn(conn, true));
+      p.on('connection', conn => this.handleConn(conn, true));
+    } catch(e) {
+      this.log('PeerJS 崩溃: ' + e);
+    }
   },
 
   // 建立连接
   connectTo(targetId) {
     if(targetId === this.myId || this.conns[targetId]) return;
-    // 超过连接上限，不再主动出击（除非是种子）
     if(Object.keys(this.conns).length >= MAX_NEIGHBORS) return;
     
     const conn = this.peer.connect(targetId, {reliable: true});
@@ -90,37 +116,31 @@ const app = {
     const pid = conn.peer;
     
     conn.on('open', () => {
-      // 连接成功
       this.conns[pid] = conn;
-      this.knownPeers.add(pid); // 记入小本本
+      this.knownPeers.add(pid); 
       ui.renderList();
       
-      // 握手
       conn.send({t: 'HELLO', n: this.myName});
     });
 
     conn.on('data', d => {
-      // 1. 基础信息交换
       if(d.t === 'HELLO') {
         conn.label = d.n;
-        this.log(`🔗 连上: ${d.n}`);
+        // this.log(`🔗 连上: ${d.n}`);
         ui.renderList();
       }
       
-      // 2. 通讯录交换 (Gossip)
       if(d.t === 'PEER_EX' && Array.isArray(d.list)) {
         d.list.forEach(id => this.knownPeers.add(id));
-        // 如果我很缺连接，就从这里面挑人连
         this.fillSlots();
       }
       
-      // 3. 消息处理 (Flood)
       if(d.t === 'MSG') {
-        if(this.seenMsgs.has(d.id)) return; // 已阅，丢弃
+        if(this.seenMsgs.has(d.id)) return; 
         this.seenMsgs.add(d.id);
         
         ui.appendMsg(d.sender, d.txt, false);
-        this.flood(d, pid); // 传给除了来源外的其他人
+        this.flood(d, pid); 
       }
     });
 
@@ -133,52 +153,49 @@ const app = {
     ui.renderList();
   },
 
-  // 广播 (Flood)
   flood(packet, excludeId) {
     Object.keys(this.conns).forEach(pid => {
-      if(pid !== excludeId) {
+      if(pid !== excludeId && this.conns[pid].open) {
         try { this.conns[pid].send(packet); } catch(e){}
       }
     });
   },
 
-  // 发送入口
   sendText(txt) {
     const id = Date.now() + Math.random().toString(36);
     const packet = {t: 'MSG', id, txt, sender: this.myName};
     this.seenMsgs.add(id);
     
     ui.appendMsg('我', txt, true);
-    this.flood(packet, null); // 发给所有人
+    this.flood(packet, null);
   },
 
   // === 🕸️ 自愈逻辑 ===
-  
-  // 1. 清理无效连接
   cleanup() {
     Object.keys(this.conns).forEach(pid => {
       if(!this.conns[pid].open) this.dropPeer(pid);
     });
   },
 
-  // 2. 缺人补人
   fillSlots() {
-    const current = Object.keys(this.conns).length;
-    if (current < 3) { // 最少保持 3 个连接
-      // 从小本本里随机挑人连
+    // 只要连接数不满，就一直尝试连人
+    if (Object.keys(this.conns).length < MAX_NEIGHBORS) {
+      // 优先连种子
+      SEEDS.forEach(s => {
+        if(s !== this.myId && !this.conns[s]) this.connectTo(s);
+      });
+      
+      // 其次连已知节点
       const candidates = [...this.knownPeers].filter(p => !this.conns[p] && p !== this.myId);
       if(candidates.length > 0) {
-        // 随机连一个，避免所有人都连同一个
         const luckyOne = candidates[Math.floor(Math.random() * candidates.length)];
         this.connectTo(luckyOne);
       }
     }
   },
 
-  // 3. 交换通讯录 (Gossip)
   exchangePeers() {
-    // 随机把我知道的节点告诉我的邻居
-    const myKnowledge = [...this.knownPeers, this.myId].slice(0, 20); // 最多带20个，省流量
+    const myKnowledge = [...this.knownPeers, this.myId].slice(0, 20); 
     const packet = {t: 'PEER_EX', list: myKnowledge};
     
     Object.values(this.conns).forEach(c => {
@@ -207,7 +224,8 @@ const ui = {
 
   updateSelf() {
     document.getElementById('myId').innerText = app.myId ? app.myId.slice(0,6) : '...';
-    document.getElementById('statusText').innerText = '无主网状网络';
+    const role = app.isSeed ? '👑 种子节点' : '普通节点';
+    document.getElementById('statusText').innerText = role;
     document.getElementById('statusDot').className = 'dot ' + (app.myId ? 'online':'');
   },
 
@@ -230,7 +248,7 @@ const ui = {
           <div class="avatar" style="background:#333">${(c.label||pid)[0]}</div>
           <div class="c-info">
             <div class="c-name">${c.label || pid.slice(0,6)}</div>
-            <div class="c-msg">直连节点</div>
+            <div class="c-msg">${pid.includes('p1-s') ? '引导节点' : '直连'}</div>
           </div>
         </div>
       `;

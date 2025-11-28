@@ -15,7 +15,7 @@ const MAX_PEERS = 15;
 const CHUNK_SIZE = 64 * 1024; 
 
 // 🔥 固定种子 ID (接待员 ID)
-const PUBLIC_HUB_ID = 'p1-hub-v2'; 
+const PUBLIC_HUB_ID = 'p1-hub-v3'; // 升级版本号，避开旧缓存
 
 // ===================== 核心逻辑 (Mesh Core) =====================
 const app = {
@@ -25,7 +25,7 @@ const app = {
   peer: null,
   serverIdx: 0,
   knownPeers: new Set(JSON.parse(localStorage.getItem('p1_peers')||'[]')),
-  isHub: false, // 标记自己是否成为了接待员
+  isHub: false,
   
   seenMsgIds: new Set(),
   fileChunks: {},
@@ -43,12 +43,9 @@ const app = {
   },
 
   init() {
-    // 启动时，先尝试作为普通人连接
     this.connect();
-    
     setInterval(() => this.keepAlive(), 5000);
     setInterval(() => { if(this.seenMsgIds.size > 5000) this.seenMsgIds.clear(); }, 60000);
-    
     document.addEventListener('visibilitychange', () => {
       if(document.visibilityState==='visible' && !this.peer) this.connect();
     });
@@ -65,92 +62,87 @@ const app = {
         config: { iceServers: ICE }, debug: 1
       };
       
-      // 如果指定了 forceId (通常是想成为 Hub)，则使用它
-      // 否则优先使用本地存储 ID，没有则随机
+      // 优先策略：如果有强制ID则用，否则用本地缓存，最后随机
       let idToUse = forceId || this.localId || undefined;
-      
-      // ⚠️ 特殊逻辑：如果我是为了抢占 Hub 而重启，ID 必须是 Hub ID
       if(forceId === PUBLIC_HUB_ID) idToUse = PUBLIC_HUB_ID;
 
       this.peer = new Peer(idToUse, opts);
     } catch(e) { this.nextServer(); return; }
 
     this.peer.on('open', id => {
-      this.localId = id;
-      // 只有非 Hub 的普通 ID 才保存，避免下次我也默认成了 Hub
       if(id !== PUBLIC_HUB_ID) localStorage.setItem('p1_id', id);
-      
+      this.localId = id;
       this.isHub = (id === PUBLIC_HUB_ID);
-      this.log(`✅ 身份: ${this.isHub ? '👑 接待员 (Hub)' : '👤 普通节点'} (${id})`);
       
+      this.log(`✅ ID: ${id} ${this.isHub ? '(👑 接待员)' : ''}`);
       this.updateStatus();
       this.requestWakeLock();
       
       if (this.isHub) {
-        // 我是接待员：等待别人连我，不用主动干啥
-        this.log('正在等待其他节点接入...');
+        // 我是接待员：坐等连接
       } else {
-        // 我是普通人：必须立刻去找接待员
-        this.log('正在寻找接待员...');
-        this.dial(PUBLIC_HUB_ID); // 👈 关键：呼叫固定接待员
-        
-        // 同时也呼叫历史好友
-        this.knownPeers.forEach(pid => {
-          if(pid !== PUBLIC_HUB_ID) this.dial(pid);
-        });
+        // 我是普通人：立刻寻找接待员
+        this.checkHubStatus(); 
+        // 同时回拨老朋友
+        this.knownPeers.forEach(pid => { if(pid !== PUBLIC_HUB_ID) this.dial(pid); });
       }
     });
 
     this.peer.on('connection', conn => this.setupConn(conn, true));
     
     this.peer.on('error', err => {
-      // this.log(`⚠️ ${err.type}`);
-      
-      if(['network','server-error'].includes(err.type)) {
-        this.nextServer();
-      }
-      else if(err.type === 'unavailable-id') {
-        // ID 被占用
-        if (this.localId === PUBLIC_HUB_ID) {
-           this.log('👑 接待员已存在，退化为普通节点...');
-           // Hub 被人占了，那我做普通人，重新生成随机 ID
-           this.localId = ''; 
+      if(err.type === 'unavailable-id') {
+        // ID冲突（通常发生在争抢 Hub 时）
+        if (this.localId === PUBLIC_HUB_ID || !this.localId) {
+           this.log('👑 接待员席位已满，转为普通节点...');
            localStorage.removeItem('p1_id');
+           this.localId = ''; // 清空 ID，让 PeerJS 随机生成
            if(this.peer) this.peer.destroy();
            this.peer = null;
-           setTimeout(() => this.connect(), 500);
-        } else {
-           // 普通 ID 被占，重置
-           localStorage.removeItem('p1_id'); 
-           this.localId=''; 
-           this.connect(); 
+           setTimeout(() => this.connect(), 200); // 极速重连
         }
       }
-      else if(err.type === 'peer-unavailable') {
-        // ⚠️ 关键逻辑：找不到连接对象
-        // 如果我试图连接 PUBLIC_HUB_ID 失败了，说明没人当接待员
-        // 那我就去当接待员！
-        const target = err.message.split(' ').pop(); // 尝试解析 ID
-        if (target.includes(PUBLIC_HUB_ID) || this.conns[PUBLIC_HUB_ID]?.open === false) {
-           this.log('🚨 没找到接待员，正在尝试上位...');
-           this.becomeHub();
-        }
+      else if(['network','server-error','socket-error'].includes(err.type)) {
+        this.log('网络故障，切换线路...');
+        this.nextServer();
       }
     });
     
-    this.peer.on('disconnected', () => { this.peer.reconnect(); });
+    this.peer.on('disconnected', () => { if(this.peer) this.peer.reconnect(); });
     this.peer.on('close', () => { this.peer = null; this.updateStatus(); });
   },
 
-  // 👑 篡位逻辑：销毁当前连接，以 Hub ID 重生
+  // 🔥 激进的篡位逻辑
+  checkHubStatus() {
+    // 尝试连接 Hub
+    const conn = this.peer.connect(PUBLIC_HUB_ID, {reliable:true});
+    
+    // 2秒倒计时：如果 Hub 没反应，我就是 Hub
+    const timer = setTimeout(() => {
+      if (!this.conns[PUBLIC_HUB_ID] || !this.conns[PUBLIC_HUB_ID].open) {
+        this.log('🚨 接待员缺席，正在上位...');
+        this.becomeHub();
+      }
+    }, 2000);
+
+    conn.on('open', () => {
+      clearTimeout(timer); // Hub 活着，取消篡位
+      this.setupConn(conn, false);
+    });
+    
+    // 监听 PeerJS 的报错（如果找不到 Hub 会立即报错）
+    this.peer.on('error', err => {
+      if(err.type === 'peer-unavailable' && err.message.includes(PUBLIC_HUB_ID)) {
+        clearTimeout(timer);
+        this.log('🚨 没找到接待员，正在上位...');
+        this.becomeHub();
+      }
+    });
+  },
+
   becomeHub() {
-    if (this.peer) {
-      this.peer.destroy();
-      this.peer = null;
-    }
-    setTimeout(() => {
-      this.connect(PUBLIC_HUB_ID);
-    }, 1000);
+    if(this.peer) { this.peer.destroy(); this.peer = null; }
+    setTimeout(() => this.connect(PUBLIC_HUB_ID), 500);
   },
 
   nextServer() {
@@ -164,20 +156,8 @@ const app = {
     if(Object.keys(this.conns).length >= MAX_PEERS) return;
     if(!this.peer) return;
     
-    // 只有连接 Hub 时才设置 reliable: true，其他普通节点随意
     const conn = this.peer.connect(pid, {reliable: true});
     this.setupConn(conn, false);
-    
-    // 监控连接失败（为了触发 peer-unavailable）
-    setTimeout(() => {
-      if (pid === PUBLIC_HUB_ID && (!this.conns[pid] || !this.conns[pid].open)) {
-        // 手动触发检查
-        if(!this.isHub) {
-           this.log('接待员未响应，尝试上位...');
-           this.becomeHub();
-        }
-      }
-    }, 5000); // 5秒连不上接待员就自己当
   },
 
   setupConn(conn, isIncoming) {
@@ -190,12 +170,11 @@ const app = {
       this.remember(pid);
       conn.send({type:'hello', name: this.myName});
       
-      // 如果我是 Hub，并且有新人连我，我把我知道的所有人推给他 (简单的 Peer Exchange)
+      // 接待员广播逻辑
       if (this.isHub) {
         const others = Object.keys(this.conns).filter(id => id !== pid && this.conns[id].open);
-        conn.send({type:'peers', list: others});
+        if(others.length) conn.send({type:'peers', list: others});
       }
-      
       this.updateStatus();
     });
 
@@ -214,9 +193,8 @@ const app = {
       this.updateStatus();
     }
     else if(d.type === 'peers') {
-      // 收到接待员给的名单，尝试去连这些人
       if (Array.isArray(d.list)) {
-        this.log(`收到 ${d.list.length} 个推荐节点`);
+        this.log(`收到推荐节点: ${d.list.length}个`);
         d.list.forEach(id => this.dial(id));
       }
     }
@@ -281,14 +259,14 @@ const app = {
 
   sendFile(file, targetPid) {
     if(targetPid === 'all') {
-      alert('Mesh 模式下暂不支持群发文件（防止拥堵），请先点击头像私聊');
-      return;
+      alert('为防止网络拥堵，请在侧边栏点击好友头像进行私聊传文件。');
+      return false;
     }
     const c = this.conns[targetPid];
     if(!c || !c.open) {
       this.dial(targetPid);
-      alert('正在建立直连，请稍后再试...');
-      return;
+      alert('正在建立直连通道，请稍后再试...');
+      return false;
     }
 
     const fileId = Date.now() + '-' + Math.random().toString(36).substr(2,5);
@@ -315,11 +293,10 @@ const app = {
   keepAlive() {
     if(!this.peer) return;
     const now = Date.now();
-    const pids = Object.keys(this.conns);
     
     // 只有当我不是 Hub，且我没连上 Hub 时，才疯狂重试连接 Hub
     if (!this.isHub && !this.conns[PUBLIC_HUB_ID]?.open) {
-       this.dial(PUBLIC_HUB_ID);
+       // 这里不做操作，依赖 init 里的重试或手动触发
     }
 
     Object.entries(this.conns).forEach(([pid, c]) => {
@@ -330,7 +307,7 @@ const app = {
   },
 
   remember(pid) {
-    if(pid === PUBLIC_HUB_ID) return; // 不用记 Hub，反正写死在代码里
+    if(pid === PUBLIC_HUB_ID) return;
     this.knownPeers.add(pid);
     if(this.knownPeers.size > 50) {
       const it = this.knownPeers.values();
@@ -362,7 +339,6 @@ const ui = {
     this.bindEvents();
     app.onStatus = s => {
       $('#myId').innerText = shortId(s.id);
-      // 显示是否是接待员
       const role = s.isHub ? '👑 接待员' : '普通节点';
       $('#statusText').innerText = s.connected ? `在线 (${role})` : '离线';
       $('#statusDot').className = 'dot ' + (s.connected ? 'online':'');
@@ -373,7 +349,6 @@ const ui = {
     app.onContactUpdate = conns => this.renderContacts(conns);
     
     app.onMsg = (fromId, text, type, senderName) => {
-      const isPublic = !app.conns[fromId]?.target || app.conns[fromId]?.target === 'all';
       if(this.activeChat === 'all' || this.activeChat === fromId) {
          const name = senderName || (app.conns[fromId]?.name) || shortId(fromId);
          const isHtml = type === 'file';
@@ -431,7 +406,6 @@ const ui = {
     
     Object.entries(conns).forEach(([pid, c]) => {
       if(!c.open) return;
-      // 标记接待员
       const isHub = (pid === PUBLIC_HUB_ID);
       const tag = isHub ? '👑 ' : '';
       

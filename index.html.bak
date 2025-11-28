@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1, viewport-fit=cover" />
+  <title>P2P 固定入口 + 聊天</title>
+  <style>
+    /* 入口页样式 */
+    *{box-sizing:border-box}
+    body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,'Noto Sans','PingFang SC','Microsoft YaHei',sans-serif;background:#0f1115;color:#e6e6e6}
+    .wrap{max-width:980px;margin:30px auto;padding:16px}
+    .card{border:1px solid #232634;border-radius:12px;padding:16px;background:#0b0d12}
+    h1{margin:0 0 8px;font-size:20px}
+    .row{display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap}
+    .row input[type=text]{flex:1;min-width:180px;padding:10px;border:1px solid #2b3040;border-radius:8px;background:#0f1320;color:#d7e1f2}
+    .btn{padding:10px 14px;border:1px solid #3a4660;border-radius:8px;background:#2a7cff;color:#fff;font-weight:600;cursor:pointer}
+    .btn.secondary{background:#1a2234;color:#d7e1f2}
+    .btn[disabled]{opacity:.5;cursor:not-allowed}
+    .chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+    .chip{padding:4px 10px;border-radius:999px;border:1px solid #2a3142;background:#0e1422;color:#a9c6ff;font-size:12px}
+    .box{border:1px solid #232634;border-radius:10px;padding:12px;background:#0a0c10;margin-top:12px}
+    .muted{color:#9aa7b4;font-size:12px}
+    .log{margin-top:12px;background:#0a0c10;border:1px solid #232634;border-radius:10px;padding:10px;height:220px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;color:#9fe3a6}
+    .vid{margin-top:10px;display:flex;gap:10px;flex-wrap:wrap}
+    video{max-width:380px;background:#000;border-radius:8px}
+    .qr{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+    .qr-wrap{display:inline-block;background:#ffffff;padding:16px;border-radius:10px;border:1px solid #e5e5e5}
+    #qr{width:256px;height:256px}
+    /* 嵌入聊天容器：默认隐藏，由“打开UI”按钮显示；“免打扰”也会隐藏这里 */
+    #classicHost{display:none;margin-top:20px}
+  </style>
+
+  <!-- 聊天 UI（classic）样式：修复 .chip 的 border 冒号错误 -->
+  <style>
+    :root{
+      --sidebar-fr: 0.28; --header-fr: 0.10; --send-fr: 0.18;
+      --bg: #0e0f13; --panel: #0b0d12; --fg: #e6e6e6; --muted: #9aa7b4; --line: rgba(255,255,255,.08);
+      --input-bg: #0a1120; --input-border: #2d3649; --chip: #0d1526; --chip-border: #2e3648; --btn-bg: #1a2234; --btn-border: #354059; --primary: #2a7cff; --thumb: 160px;
+    }
+    *{ box-sizing: border-box; }
+    .shell{ width:100dvw; height:100dvh; margin:0; background: var(--bg); color: var(--fg);
+      font-family: ui-sans-serif,-apple-system,system-ui,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",Arial,"Noto Sans","Hiragino Sans GB",sans-serif;
+      -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; border-radius:12px; overflow:hidden;
+    }
+    .app{
+      width:100%; height:100%;
+      display:grid;
+      grid-template-columns: calc(var(--sidebar-fr) * 100%) calc((1 - var(--sidebar-fr)) * 100%);
+      grid-template-rows: calc(var(--header-fr) * 100%) calc((1 - var(--header-fr) - var(--send-fr)) * 100%) calc(var(--send-fr) * 100%);
+      gap:10px; padding:10px;
+    }
+    .sidebar{
+      grid-column:1; grid-row:1 / span 3;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px;
+      display:grid; grid-template-rows:auto 1fr; overflow:hidden; min-width:0; min-height:0;
+    }
+    .sidebar .search{ padding:10px; border-bottom:1px solid var(--line); background:#0c1018; }
+    .sidebar .search input{
+      width:100%; height:40px; font-size:14px; background:#0f1320; color:#d7e1f2;
+      border:1px solid #32394a; border-radius:8px; padding:8px 12px; outline:none;
+    }
+    .sidebar .list{ padding:10px; overflow:auto; }
+    .contact{
+      display:grid; grid-template-columns:36px 1fr; gap:8px; align-items:center;
+      padding:8px; border:1px solid #232a3a; background:#0e1422; border-radius:10px; margin-bottom:8px; cursor:pointer;
+    }
+    .contact.active{ border-color:#3b82f6; background:#0d1526; }
+    .avatar{ width:36px; height:36px; border-radius:50%; background: linear-gradient(135deg,#5aa1ff,#7ce3ff); }
+    .cname{ font-size:13px; color:#cfe3ff; }
+    .cmsg{ font-size:12px; color:#8ea0b8; }
+
+    .header{
+      grid-column:2; grid-row:1;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px;
+      display:flex; align-items:center; gap:8px; padding:0 12px; overflow:hidden; min-width:0;
+    }
+    .chip{ padding:4px 10px; border-radius:999px; font-size:12px; background:var(--chip); border:1px solid var(--chip-border); color:#a9c6ff; white-space:nowrap; cursor:default; }
+
+    .messages{
+      grid-column:2; grid-row:2;
+      background:var(--panel); border:1px solid var(--line); border-radius:12px;
+      padding:10px; display:grid; grid-template-rows:1fr; min-height:0; min-width:0;
+    }
+    .msg-scroll{ overflow:auto; display:grid; grid-auto-rows:min-content; gap:8px; padding-right:4px; }
+    .row{ display:flex; gap:8px; align-items:flex-end; }
+    .row.right{ justify-content:flex-end; }
+    .bubble{
+      max-width:72%; padding:8px 10px; border-radius:12px; font-size:14px; line-height:1.35;
+      border:1px solid #2a3142; background:#0f1726; color:#dce8ff; word-break:break-word; min-width:0;
+    }
+    .bubble.me{ background:#163244; border-color:#23465f; }
+    .bubble.file{ background:#0f1c2e; color:#cfe3ff; padding:8px 10px; max-width:280px; }
+    .bubble.media{ background:transparent; border:none; padding:0; }
+    .file-link{ text-decoration:none; color:inherit; display:block; }
+    .file-info{ display:flex; align-items:center; gap:8px; min-width:0; }
+    .file-icon{ font-size:24px; flex-shrink:0; }
+    .file-name{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .progress-line{ margin-top:4px; font-size:12px; color:#8ea0b8; }
+
+    .thumb-link{ display:inline-block; text-decoration:none; }
+    .thumb.img{ width: var(--thumb); height:auto; display:block; border-radius:8px; }
+    .thumb.video{ position:relative; width:var(--thumb); border-radius:8px; overflow:hidden; background:#0f1726 center/cover no-repeat; }
+    .thumb.video::before{ content:''; display:block; padding-top:56.25%; }
+    .thumb.video .play{
+      position:absolute; inset:0; display:grid; place-items:center;
+      color:#fff; font-size:28px; text-shadow:0 3px 12px rgba(0,0,0,.6);
+    }
+
+    .avatar-sm{
+      width:28px; height:28px; border-radius:50%;
+      display:grid; place-items:center; background: linear-gradient(135deg,#5aa1ff,#7ce3ff);
+      flex:0 0 28px; overflow:hidden;
+    }
+    .avatar-sm .letter{ color:#fff; font-weight:700; font-size:12px; user-select:none; line-height:1; }
+
+    .send{
+      grid-column:2; grid-row:3;
+      background:var(--input-bg); border:1px solid #2d3649; border-radius:12px;
+      display:grid; grid-template-columns:auto 1fr auto; grid-template-rows:1fr auto; min-width:0; min-height:0;
+    }
+    .editor{
+      grid-column:1 / -1; grid-row:1;
+      background:transparent; color:#e5efff; line-height:1.35; font-size:14px;
+      outline:none; white-space:pre-wrap; word-break:break-word; overflow:auto; padding:10px;
+    }
+    .editor:empty:before{ content: attr(data-ph); color: var(--muted); pointer-events:none; }
+    .s-left{ grid-column:1; grid-row:2; display:flex; gap:10px; align-items:center; padding:10px; }
+    .s-actions{ grid-column:3; grid-row:2; display:flex; gap:10px; align-items:center; padding:10px; }
+    .icon{
+      display:inline-grid; place-items:center; width:38px; height:38px; border-radius:10px;
+      background:#1a2234; border:1px solid #354059; color:#d8e6ff; font-size:18px; cursor:pointer; user-select:none; flex:0 0 38px;
+    }
+    .icon input[type=file]{ display:none; }
+    .btn{ padding:8px 14px; border-radius:10px; background:#1a2234; border:1px solid #354059; color:#d8e6ff; font-size:14px; cursor:pointer; }
+    .btn.primary{ background:#2a7cff; border-color:#2a7cff; color:#fff; }
+    .btn[disabled]{ opacity:.45; cursor:not-allowed; }
+
+    .send.drag-over{ outline:2px dashed #2a7cff; outline-offset:-6px; }
+    @media (max-width: 380px){
+      .bubble{ font-size:13px; }
+      .editor{ font-size:13px; }
+    }
+
+    /* 自定义媒体卡片样式（音频/视频） - 兼容旧实现，无需删除 */
+    .media-card{display:flex;flex-direction:column;gap:6px}
+    .media-head{display:flex;align-items:center;gap:8px;min-width:0}
+    .media-title{max-width:calc(var(--thumb) - 20px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#cfe3ff;font-size:13px}
+    .media-note{margin-left:auto;color:#8ea0b8;font-size:12px}
+    .media-ctrl{display:flex;align-items:center;gap:8px}
+    .media-toggle{width:28px;height:28px;border-radius:8px;border:1px solid #354059;background:#1a2234;color:#d8e6ff;cursor:pointer}
+    .media-seek{flex:1;appearance:none;height:4px;border-radius:999px;background:#2a3142;outline:none}
+    .media-seek::-webkit-slider-thumb{appearance:none;width:12px;height:12px;border-radius:50%;background:#2a7cff;border:none;margin-top:-4px}
+    .media-seek::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:#2a7cff;border:none}
+    .media-time{min-width:84px;text-align:right;color:#8ea0b8;font-size:12px}
+
+    /* 长按复制的轻提示（利用 data-copied 属性） */
+    [data-copied]:after{
+      content: attr(data-copied);
+      position:absolute; transform:translateY(-100%); margin-top:-6px;
+      background:#1a2234; color:#cfe3ff; font-size:12px; padding:2px 6px; border-radius:6px; border:1px solid #354059;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>🚀 固定入口 · P2P 连接配置</h1>
+      <div class="muted">点击“打开UI”后，聊天界面会在当前页面显示；点击聊天头部的“免打扰”可完全隐藏。</div>
+
+      <div class="row">
+        <input id="nickname" type="text" placeholder="昵称（可选）" />
+        <input id="networkName" type="text" placeholder="网络名（可选，默认 public-network）" />
+      </div>
+
+      <div class="row">
+        <button id="connectBtn" class="btn">🔌 连接网络</button>
+        <button id="openUI" class="btn secondary">💬 打开UI</button>
+        <button id="copyShare" class="btn secondary">🔗 复制我的分享链接</button>
+        <button id="copyLog" class="btn secondary">📋 复制日志</button>
+        <button id="clearLog" class="btn secondary">🧹 清空日志</button>
+        <button id="callBtn" class="btn secondary" disabled>🎥 快速视频通话</button>
+      </div>
+
+      <div class="chips">
+        <span class="chip" id="entryStatusChip">状态：离线</span>
+        <span class="chip">在线 <span id="peerCount">0</span></span>
+        <span class="chip">本机ID <span id="localId">-</span></span>
+        <span class="chip">虚拟IP <span id="virtualIp">-</span></span>
+        <span class="chip">在线时长 <span id="uptime">00:00:00</span></span>
+      </div>
+
+      <div id="share" class="box" style="display:none">
+        <div class="qr">
+          <div class="qr-wrap"><div id="qr"></div></div>
+          <div>
+            <div class="muted">分享给好友：用链接或扫码，朋友打开后自动与你建立连接</div>
+            <div class="row"><input id="shareLink" type="text" readonly value="" style="min-width:360px" /></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="log" id="log"></div>
+
+      <div class="vid">
+        <video id="localVideo" autoplay muted playsinline></video>
+        <video id="remoteVideo" autoplay playsinline></video>
+      </div>
+    </div>
+
+    <!-- 嵌入聊天 UI（默认隐藏，通过“打开UI”显示；“免打扰”完全隐藏） -->
+    <div id="classicHost">
+      <div class="shell">
+        <div class="app">
+          <aside class="sidebar" aria-label="联系人">
+            <div class="search"><input id="contactSearch" placeholder="搜索联系人" /></div>
+            <div class="list" id="contactList"></div>
+          </aside>
+
+          <header class="header" aria-label="顶部栏">
+            <span class="chip" id="statusChip">未连接</span>
+            <span class="chip" id="onlineChip">在线 0</span>
+            <span class="chip">聊天中</span>
+            <span class="chip">免打扰</span>
+            <span class="chip">群设置</span>
+          </header>
+
+          <main class="messages" aria-label="消息列表">
+            <!-- 群聊默认容器；单聊容器由 JS 动态创建 -->
+            <div id="msgScroll" class="msg-scroll"></div>
+          </main>
+
+          <section class="send" aria-label="发送区" id="sendArea">
+            <div id="editor" class="editor" contenteditable="true" data-ph="输入消息… 回车发送，Shift+Enter 换行"></div>
+            <div class="s-left">
+              <button id="emojiBtn" class="icon" title="表情">😀</button>
+              <label class="icon" title="附件">📎<input id="fileInput" type="file" multiple /></label>
+            </div>
+            <div class="s-actions">
+              <button id="sendBtn" class="btn primary" disabled>发送</button>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 依赖库 -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.0/dist/peerjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/davidshimjs-qrcodejs@0.0.2/qrcode.min.js"></script>
+
+  <!-- 配置注入：与 easytier.js 保持一致 -->
+  <script>
+    // 服务与网络名（按需改为你的 PeerJS/信令服务器）
+    window.FIXED_SERVER  = { host:'peerjs.92k.de', port:443, secure:true, path:'/' };
+    window.FIXED_NETWORK = 'public-network';
+
+    // 告诉脚本我们在“入口页”且使用“经典 UI”
+    window.__ENTRY_PAGE__ = true;
+    window.CLASSIC_UI = true;
+
+    // 默认隐藏聊天 UI：仅当用户点击“打开UI”才显示
+    try{
+      if (localStorage.getItem('classicMuted') === null){
+        localStorage.setItem('classicMuted','1');
+      }
+    }catch(e){}
+  </script>
+
+  <!-- 主逻辑（使用你替换过的新 easytier.js；确保本���只引入一次） -->
+  <script src="easytier.js"></script>
+
+  <!-- 入口页脚本：按钮行为、状态同步、免打扰时完全隐藏容器 + 防闪烁 -->
+  <script>
+    const $ = s => document.querySelector(s);
+    const logEl = $('#log');
+    function log(s){ logEl.textContent += (logEl.textContent ? '\n' : '') + s; logEl.scrollTop = logEl.scrollHeight; }
+    window._entryLog = log;
+
+    // 覆盖 setMuted：在嵌入模式下，除了隐藏 .app，也隐藏整个 #classicHost 容器，实现“完全隐藏”
+    (function patchMuted(){
+      function tryPatch(){
+        if (!window.app || !app.setMuted) { setTimeout(tryPatch, 100); return; }
+        var orig = app.setMuted;
+        app.setMuted = function(flag){
+          try{ orig.call(app, flag); }catch(e){}
+          var host = document.getElementById('classicHost');
+          if (host) host.style.display = flag ? 'none' : 'block';
+        };
+        // 初始跟随本地状态
+        try{
+          var muted = localStorage.getItem('classicMuted') === '1';
+          var host = document.getElementById('classicHost');
+          if (host) host.style.display = muted ? 'none' : 'block';
+        }catch(e){}
+      }
+      tryPatch();
+    })();
+
+    document.addEventListener('DOMContentLoaded', function(){
+      const connectBtn = $('#connectBtn');
+      const openUI     = $('#openUI');
+      const copyShare  = $('#copyShare');
+      const copyLogBtn = $('#copyLog');
+      const clearLogBtn= $('#clearLog');
+      const callBtn    = $('#callBtn');
+      const nickIpt    = $('#nickname');
+
+      const savedNick = localStorage.getItem('nickname') || '';
+      if (savedNick) nickIpt.value = savedNick;
+
+      connectBtn.addEventListener('click', ()=>{
+        localStorage.setItem('nickname', (nickIpt.value||'').trim());
+        if (window.app){
+          // app.toggle 内部会读取 #networkName 的值
+          app.toggle();
+        }
+      });
+
+      openUI.addEventListener('click', ()=>{
+        // 仅显示，并清除免打扰状态
+        try{ localStorage.setItem('classicMuted','0'); }catch(e){}
+        const host = document.getElementById('classicHost');
+        if (host) host.style.display = 'block';
+        if (window.app && app.showUI) app.showUI();
+        if (host && host.scrollIntoView) host.scrollIntoView({behavior:'smooth', block:'start'});
+      });
+
+      copyShare.addEventListener('click', ()=> window.app && app.copyLink());
+      copyLogBtn.addEventListener('click', ()=> window.app && app.copyLog());   // 复制“全量日志”
+      clearLogBtn.addEventListener('click', ()=> window.app && app.clearLog());
+      callBtn.addEventListener('click', ()=> window.app && app.quickCall());    // 入口页直拨
+
+      // 入口页状态同步（仅变更才更新，避免闪烁；uptime 仍按传入值更新）
+      (function(){
+        const last = { connected:null, online:null, localId:null, virtualIp:null };
+        window.updateEntryStatus = function(state){
+          const s = state || {};
+          if (last.connected !== s.connected){
+            $('#entryStatusChip').textContent = '状态：' + (s.connected ? '在线' : '离线');
+            $('#share').style.display = s.connected ? 'block' : 'none';
+            $('#callBtn').disabled = !s.connected;
+            connectBtn.textContent = s.connected ? '🔌 断开' : '🔌 连接网络';
+            last.connected = s.connected;
+          }
+          if (last.online !== s.online){
+            $('#peerCount').textContent = String(s.online || 0);
+            last.online = s.online;
+          }
+          if (last.localId !== s.localId){
+            $('#localId').textContent = s.localId || '-';
+            last.localId = s.localId || '';
+          }
+          if (last.virtualIp !== s.virtualIp){
+            $('#virtualIp').textContent = s.virtualIp || '-';
+            last.virtualIp = s.virtualIp || '';
+          }
+          // uptime 每秒都会变化，直接更新即可
+          $('#uptime').textContent = s.uptime || '00:00:00';
+        };
+      })();
+
+      // 初始默认隐藏聊天 UI（由 localStorage 控制）
+      try{
+        const host = document.getElementById('classicHost');
+        const muted = localStorage.getItem('classicMuted') === '1';
+        if (host) host.style.display = muted ? 'none' : 'block';
+      }catch(e){}
+    });
+
+    window.addEventListener('beforeunload', function(e){
+      if (window.app && app.isConnected) {
+        e.preventDefault();
+        e.returnValue = '关闭页面将断开连接，确定吗？';
+      }
+    });
+  </script>
+</body>
+</html>
